@@ -2,12 +2,19 @@ import pywt
 from operator import itemgetter
 from scipy.spatial import distance
 from hcluster import pdist, linkage, dendrogram, fcluster
+import pylab
+from numpy import *
 
 def partition(lst, n):
 	division = len(lst) / float(n)
 	return [ lst[int(round(division * i)): int(round(division * (i + 1)))] for i in xrange(n) ]
 
-def wavelet_avg(X,Y,L=5,reshape=False,plot_xy=False,zero_thresh=1*10**-6):
+def wavelet_avg(Y,X=None,reshape=False,plot_xy=False,zero_thresh=1*10**-7,Names=None,Title=None):
+	if not X:
+		X = range(Y.shape[0])
+	w = pywt.Wavelet('sym2')
+	L = pywt.dwt_max_level(Y.shape[0],w)
+	#L = pywt.swt_max_level(Y.shape[0])
 	Zavg = zeros((L,len(X)))
 	Zavgabs = zeros((L,len(X)))
 	if reshape:
@@ -15,18 +22,28 @@ def wavelet_avg(X,Y,L=5,reshape=False,plot_xy=False,zero_thresh=1*10**-6):
 	else:
 		e = [X[0],X[-1],0,L]
 	sp = 1
+	if not Names:
+		Names = ["Series "+str(y+1) for y in range(Y.shape[1])]
+	if Title:
+		pylab.suptitle(Title)
 	if plot_xy:
 		tp = str(Y.shape[1]+3)
 		pylab.subplot(int(''.join([tp,'1',str(sp)])))
-		pylab.plot(X,Y)
+		P = pylab.plot(X,Y)
+		pylab.legend(P,Names,prop={'size':6})
+		pylab.xlim([0,Y.shape[0]-1])
+		pylab.title("Relative Abundance Time Series")
 		sp += 1
 	else:
 		tp = str(Y.shape[1]+2)
 	for y in range(Y.shape[1]):
-		C = pywt.wavedec(Y[:,y],'db1',level=L)
+		C = pywt.wavedec(Y[:,y],w,level=L)
+		#C = pywt.swt(Y[:,y],w,level=L)
+		#C = ['dummy'] + [c[1] for c in C]
 		Z = wavelet_matrix(C,L,len(X))
 		pylab.subplot(int(''.join([tp,'1',str(sp)])))
 		pylab.imshow(abs(Z),extent=e)
+		pylab.title(Names[y])
 		sp += 1
 		Zavg += Z
 		Zavgabs += abs(Z)
@@ -34,9 +51,13 @@ def wavelet_avg(X,Y,L=5,reshape=False,plot_xy=False,zero_thresh=1*10**-6):
 	Zavg[Zavg<zero_thresh] = 0
 	pylab.subplot(int(''.join([tp,'1',str(sp)])))
 	pylab.imshow(abs(Zavg),extent=e)
+	pylab.title("Decomposition Avg")
 	sp += 1
+	Zavgabs /= Y.shape[1]
+	Zavgabs[Zavgabs<zero_thresh] = 0
 	pylab.subplot(int(''.join([tp,'1',str(sp)])))
 	pylab.imshow(abs(Zavgabs),extent=e)
+	pylab.title("abs(Decomposition) Sum")
 	sp += 1
 	pylab.show()
 	return Zavg
@@ -92,12 +113,18 @@ def normalize_to_abundances(Y,amin=0,amax=1):
 		Y[i,:] = Y[i,:]/Y[i,:].sum()
 	return Y
 
-def c_dists(Y,level_weights=False):
-	w = pywt.Wavelet('db1')
-	L = pywt.dwt_max_level(Y.shape[0],w)
-	C = [pywt.wavedec(Y[:,i],w,level=L) for i in range(Y.shape[1])]
+def c_dists(Y,use_swt=True,level_weights=False):
+	w = pywt.Wavelet('sym2')
+	if use_swt:
+		L = pywt.swt_max_level(Y.shape[0])
+		C = [pywt.swt(Y[:,i],w,level=L) for i in range(Y.shape[1])]
+		C = [[list(reshape(l[0],-1)) + list(reshape(l[1],-1)) for l in c] for c in C]
+	else:
+		L = pywt.dwt_max_level(Y.shape[0],w)
+		C = [pywt.wavedec(Y[:,i],w,level=L) for i in range(Y.shape[1])]
 	if level_weights:
-		C = [c[1:] for c in C]
+		if use_swt:
+			raise NameError('No level weights with SWT')
 		Wc = [1. for x in range(1,L+1)]
 		D = zeros((len(C),len(C)))
 		for i in range(len(C)):
@@ -115,17 +142,18 @@ def c_dists(Y,level_weights=False):
 			Cn.append(cn)
 		return abs(pdist(Cn,'cosine'))
 
-def wavelet_clusters(Y,ct=0.5,weights=False,return_clusters=False):
+def wavelet_clusters(Y,ct=0.5,weights=False,return_clusters=False,swt=False):
 	if weights:
-		D = abs(c_dists(Y,level_weights=True))
+		D = abs(c_dists(Y,level_weights=True,use_swt=False))
 		Dr = []
 		for i in range(D.shape[0]-1):
 			Dr += list(D[i,i+1:])
 	else:
-		Dr = c_dists(Y)
+		Dr = c_dists(Y,use_swt=swt)
 	if return_clusters:
 		L = linkage(Dr,method='single',metric='cosine')
-		return fcluster(L,ct,criterion='distance')
+		C = fcluster(L,ct,criterion='distance')
+		return cluster_sets(C)
 	plot_clusters(Dr,ct)
 
 def time_series_clusters(Y,ct=0.5,return_clusters=False):
@@ -133,7 +161,8 @@ def time_series_clusters(Y,ct=0.5,return_clusters=False):
 	D = abs(D)
 	if return_clusters:
 		L = linkage(D,method='single',metric='cosine')
-		return fcluster(L,ct,criterion='distance')
+		C = fcluster(L,ct,criterion='distance')
+		return cluster_sets(C)
 	plot_clusters(D,ct)
 
 def plot_clusters(Dr,ct):
@@ -154,16 +183,9 @@ def create_population(types,n,rand_periods=1):
 			Y = concatenate((Y,y),axis=1)
 		else:
 			Y = y
-	return normalize_to_abundances(Y*random.poisson(10,(1,Y.shape[1]))[:,newaxis][0])
+	return normalize_to_abundances(Y*random.power(.5,(1,Y.shape[1]))[:,newaxis][0])
 
 def check_clusters(result_sets,answer_sets):
-	result_sets = sorted(enumerate(result_sets),key=itemgetter(1))
-	rs = [[result_sets[0][0]]]
-	for i in range(1,len(result_sets)):
-		if result_sets[i][1] != result_sets[i-1][1]:
-			rs.append([])
-		rs[-1].append(result_sets[i][0])
-	result_sets = [set(l) for l in rs if len(l)>1]
 	s = 0
 	matched_sets = []
 	for rs in result_sets:
@@ -174,24 +196,40 @@ def check_clusters(result_sets,answer_sets):
 				break
 	return s,matched_sets
 
-def iter_rand_clusters(m,n=10,r=3):
+def cluster_sets(cluster_array):
+	cluster_array = sorted(enumerate(cluster_array),key=itemgetter(1))
+	rs = [[cluster_array[0][0]]]
+	for i in range(1,len(cluster_array)):
+		if cluster_array[i][1] != cluster_array[i-1][1]:
+			rs.append([])
+		rs[-1].append(cluster_array[i][0])
+	return [set(l) for l in rs if len(l)>1]
+
+def iter_rand_clusters(types,m,n=10,r=3,swt=True):
+	A = {'nonlinear': [],'doppler': []}
+	i = 0
+	for t in types:
+		if t[0] != 'rand':
+			A[t[0]] += range(i,i+t[1])
+			i += t[1]
+	A0 = [set(A['nonlinear'] + A['doppler'])]
+	A = [set(v) for v in A.values() if len(v)>1]
+	ta = sum([len(s) for s in A])
+	print ta
 	tsum = 0
-	isum = 0
 	wsum = 0
+	if swt:
+		wct = 0.1
+	else:
+		wct = 0.08
 	for i in range(n):
 		Y = create_population(types,m,rand_periods=r)
 		t = time_series_clusters(Y,ct=0.5,return_clusters=True)
 		t0 = check_clusters(t,A)
-		t = wavelet_clusters(Y,ct=0.08,return_clusters=True)
+		t = wavelet_clusters(Y,ct=wct,return_clusters=True,swt=swt)
 		t1 = check_clusters(t,A0)
-		l = list(frozenset().union(*t1[1]))
-		if len(l) > 0:
-			t = wavelet_clusters(Y[:,l],ct=0.5,weights=True,return_clusters=True)
-			t2 = check_clusters(t,A0)
-		else:
-			t2 = (0,0)
-		print t0[0],t1[0],t2[0]
-		tsum += t0[0]
-		isum += t1[0]
-		wsum += t2[0]
-	print tsum,isum,wsum
+		if (t0[0] < ta) and (t1[0] < ta):
+			print t0[0],t1[0]
+			tsum += t0[0]
+			wsum += t1[0]
+	print tsum,wsum
